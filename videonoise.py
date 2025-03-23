@@ -6,9 +6,9 @@ import pandas as pd
 from PIL import Image
 import matplotlib.pyplot as plt
 from moviepy.editor import AudioFileClip, VideoClip, VideoFileClip, ImageSequenceClip
+from scipy.fftpack import fftn, ifftn, fftfreq
 
 
-AUDIO_SAMPLE_RATE = 44100
 
 def read_face_landmarks(csv_path):
     """
@@ -127,7 +127,7 @@ def video_to_numpy_array(clip):
     return frames_array
 
 
-def filter_spatial(array, high = True, low = False):
+def spatial_filter(array, high = True, low = False):
     frames, rows, cols, channels = array.shape
     low_cutoff = int(min(rows, cols) * (0.45))
     high_cutoff = int(min(rows, cols) * (0.01))
@@ -167,6 +167,53 @@ def filter_spatial(array, high = True, low = False):
             filtered_array[i, :, :, j] = np.abs(filtered_image)
 
     return filtered_array
+    
+    
+def temporal_filter(image_stack, fps=30):
+    """
+    Filters a 4D image stack along the temporal dimension using predefined frequency bands.
+    
+    Parameters:
+        image_stack (numpy.ndarray): A 4D array of shape (H, W, T, 3)
+        fps (float): Frame rate (default: 42.5 Hz, assuming Nyquist limit of 21.25 Hz)
+    
+    Returns:
+        dict: A dictionary where keys are center frequencies and values are filtered image stacks.
+    """
+    H, W, T, C = image_stack.shape
+    
+    # Define the center frequencies and their bandwidth (0.33 octaves)
+    center_frequencies = np.array([0.59, 1.18, 2.37, 4.73, 9.47, 18.93])
+    bandwidth_factor = 2 ** 0.33  # 0.33 octaves width
+    
+    # Compute temporal frequencies
+    temporal_freqs = fftfreq(T, d=1/fps)  # Frequency bins for the time dimension
+    temporal_freqs = np.fft.fftshift(temporal_freqs)  # Shift zero frequency to the center
+    
+    # Perform 3D FFT along the temporal dimension only
+    fft_transformed = fftn(image_stack, axes=[2])  # FFT along the temporal dimension (T)
+    fft_transformed = np.fft.fftshift(fft_transformed, axes=[2])  # Shift for frequency masking
+    
+    filtered_results = {}
+    
+    for fc in center_frequencies:
+        # Construct a Gaussian-like bandpass filter in frequency space
+        lower_bound = fc / bandwidth_factor
+        upper_bound = fc * bandwidth_factor
+        
+        bandpass_mask = (temporal_freqs >= lower_bound) & (temporal_freqs <= upper_bound)
+        
+        # Apply the mask
+        filtered_fft = fft_transformed * bandpass_mask[np.newaxis, np.newaxis, :, np.newaxis]
+        
+        # Inverse FFT to transform back to the spatial-temporal domain
+        filtered_fft = np.fft.ifftshift(filtered_fft, axes=[2])  # Shift back
+        filtered_image_stack = np.real(ifftn(filtered_fft, axes=[2]))
+        
+        filtered_results[fc] = filtered_image_stack
+    
+    return filtered_results
+
     
 
 def generate_white_noise_video(width=12, height=480, fps=30, duration=10):
@@ -225,18 +272,23 @@ def main():
         # cropping so that face never leaves frame
         face_coords = get_face(coordinates)
         cropped_clip = crop_video(video_clip, face_coords)
-        #save_video(args.output+".mp4", cropped_clip)
+        array = video_to_numpy_array(cropped_clip)
+        i = 0
+        for freq_filtered in temporal_filter(array):
+            temp_filt_vid = ImageSequenceClip(list(freq_filtered), fps=30)
+            save_video(args.output+string(i)+".mp4", cropped_clip)
+            i+=1
         
         
         # cropping out video of just the face
 
-        mouth_coords = get_mouth(coordinates)
-        mouth_clip = crop_video(video_clip, mouth_coords)
+        # mouth_coords = get_mouth(coordinates)
+        # mouth_clip = crop_video(video_clip, mouth_coords)
         #save_video(args.output+'mouth.mp4', mouth_clip)
-        mouth_array = video_to_numpy_array(mouth_clip)
-        filtered_mouth = filter_spatial(mouth_array)
-        filtered_mouth_clip = ImageSequenceClip(list(filtered_mouth), fps=30)
-        save_video(args.output + 'filtered_mouth.mp4', filtered_mouth_clip)
+        # mouth_array = video_to_numpy_array(mouth_clip)
+        # filtered_mouth = spatial_filter(mouth_array)
+        # filtered_mouth_clip = ImageSequenceClip(list(filtered_mouth), fps=30)
+        # save_video(args.output + 'filtered_mouth.mp4', filtered_mouth_clip)
 
 if __name__ == "__main__":
     try:
