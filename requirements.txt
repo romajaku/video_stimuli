@@ -1,4 +1,8 @@
 numpy
 pydub
-moviepy
+scipy
 build
+pathlib
+pillow
+matplotlib
+conda-forge::moviepy

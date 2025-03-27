@@ -6,7 +6,7 @@ import pandas as pd
 from PIL import Image
 import matplotlib.pyplot as plt
 from moviepy.editor import AudioFileClip, VideoClip, VideoFileClip, ImageSequenceClip
-from scipy.fftpack import fftn, ifftn, fftfreq
+from scipy.fftpack import fftn, ifftn, fftfreq, fft2, fftshift, rfft, rfftfreq
 
 
 
@@ -169,50 +169,160 @@ def spatial_filter(array, high = True, low = False):
     return filtered_array
     
     
-def temporal_filter(image_stack, fps=30):
+def temporal_filter_chunked(image_stack, fps=42.5, chunk_size=50):
     """
-    Filters a 4D image stack along the temporal dimension using predefined frequency bands.
-    
+    Filters a 4D image stack along the temporal dimension using predefined frequency bands
+    in a memory-efficient, chunked manner.
+
     Parameters:
         image_stack (numpy.ndarray): A 4D array of shape (H, W, T, 3)
-        fps (float): Frame rate (default: 42.5 Hz, assuming Nyquist limit of 21.25 Hz)
-    
+        fps (float): Frame rate (default: 42.5 Hz)
+        chunk_size (int): Number of rows to process at one time (adjust based on memory)
+
     Returns:
         dict: A dictionary where keys are center frequencies and values are filtered image stacks.
+              Each filtered stack has shape (H, W, T, 3).
     """
+    # Convert to float32 to reduce memory usage
+    image_stack = image_stack.astype(np.float32)
+    
     H, W, T, C = image_stack.shape
     
     # Define the center frequencies and their bandwidth (0.33 octaves)
     center_frequencies = np.array([0.59, 1.18, 2.37, 4.73, 9.47, 18.93])
     bandwidth_factor = 2 ** 0.33  # 0.33 octaves width
+
+    # Compute frequency bins using rfftfreq for the real FFT
+    freqs = np.fft.rfftfreq(T, d=1/fps)
     
-    # Compute temporal frequencies
-    temporal_freqs = fftfreq(T, d=1/fps)  # Frequency bins for the time dimension
-    temporal_freqs = np.fft.fftshift(temporal_freqs)  # Shift zero frequency to the center
-    
-    # Perform 3D FFT along the temporal dimension only
-    fft_transformed = fftn(image_stack, axes=[2])  # FFT along the temporal dimension (T)
-    fft_transformed = np.fft.fftshift(fft_transformed, axes=[2])  # Shift for frequency masking
-    
-    filtered_results = {}
-    
+    # Pre-calculate masks for each center frequency (shape: (T_rfft,))
+    masks = {}
     for fc in center_frequencies:
-        # Construct a Gaussian-like bandpass filter in frequency space
         lower_bound = fc / bandwidth_factor
         upper_bound = fc * bandwidth_factor
+        # Use absolute frequencies
+        mask = ((np.abs(freqs) >= lower_bound) & (np.abs(freqs) <= upper_bound)).astype(np.float32)
+        masks[fc] = mask  # shape (T_rfft,)
+
+    # Prepare an output dictionary with empty arrays to fill in
+    filtered_results = {fc: np.empty((H, W, T, C), dtype=np.float32) for fc in center_frequencies}
+
+    # Process the image stack in chunks along the height dimension
+    for row_start in range(0, H, chunk_size):
+        row_end = min(row_start + chunk_size, H)
+        # Select the chunk: shape (chunk_size, W, T, C)
+        chunk = image_stack[row_start:row_end, :, :, :]
         
-        bandpass_mask = (temporal_freqs >= lower_bound) & (temporal_freqs <= upper_bound)
+        # Compute the real FFT along the temporal axis (axis 2)
+        # The result has shape (chunk_size, W, T_rfft, C)
+        fft_chunk = np.fft.rfft(chunk, axis=2)
         
-        # Apply the mask
-        filtered_fft = fft_transformed * bandpass_mask[np.newaxis, np.newaxis, :, np.newaxis]
-        
-        # Inverse FFT to transform back to the spatial-temporal domain
-        filtered_fft = np.fft.ifftshift(filtered_fft, axes=[2])  # Shift back
-        filtered_image_stack = np.real(ifftn(filtered_fft, axes=[2]))
-        
-        filtered_results[fc] = filtered_image_stack
-    
+        # Process each center frequency separately
+        for fc in center_frequencies:
+            mask = masks[fc]
+            # Reshape mask for broadcasting: (1, 1, T_rfft, 1)
+            mask_reshaped = mask[np.newaxis, np.newaxis, :, np.newaxis]
+            # Apply the mask to the FFT chunk
+            filtered_fft_chunk = fft_chunk * mask_reshaped
+            # Inverse FFT to obtain filtered chunk in the time domain
+            filtered_chunk = np.fft.irfft(filtered_fft_chunk, n=T, axis=2).astype(np.float32)
+            # Save the processed chunk into the corresponding output array
+            filtered_results[fc][row_start:row_end, :, :, :] = filtered_chunk
+
     return filtered_results
+    
+    
+def reconstruct_filtered_array(filtered_dict, omit_bands=[]):
+    """
+    Reconstructs a 4D image stack from frequency-filtered components, excluding specified bands.
+    
+    Parameters:
+        filtered_dict (dict): Dictionary where keys are frequency bands (e.g., (low, high)) 
+                              and values are 4D numpy arrays of shape (H, W, T, 3).
+        omit_bands (list): List of frequency bands (tuples) to omit from reconstruction.
+    
+    Returns:
+        numpy.ndarray: The reconstructed 4D array of shape (H, W, T, 3).
+    """
+    # Get the shape from any item in the dictionary
+    first_key = next(iter(filtered_dict))
+    H, W, T, C = filtered_dict[first_key].shape
+    
+    # Initialize an empty array for reconstruction
+    reconstructed = np.zeros((H, W, T, C), dtype=np.float32)
+    
+    # Sum up all filtered components except the omitted ones
+    for band, array in filtered_dict.items():
+        if band not in omit_bands:
+            reconstructed += array  # Add the frequency component
+    
+    return reconstructed
+    
+    
+    
+def plot_fourier_distribution(image_stack, fps=42.5):
+    """
+    Plots the spatial and temporal frequency distributions of a 4D image stack.
+    
+    Parameters:
+        image_stack (numpy.ndarray): A 4D array of shape (H, W, T, 3)
+        fps (float): Frame rate of the video (default: 42.5 Hz)
+    
+    Returns:
+        None (displays plots)
+    """
+    H, W, T, C = image_stack.shape
+    
+    # --- Compute spatial Fourier transform (2D FFT per frame and channel) ---
+    spatial_spectrum = np.zeros((H, W))  # Average over time and channels
+    for t in range(T):
+        for c in range(C):
+            fft_frame = fft2(image_stack[:, :, t, c])  # 2D FFT
+            fft_frame = np.abs(fftshift(fft_frame))  # Shift zero freq to center
+            spatial_spectrum += fft_frame
+    
+    spatial_spectrum /= (T * C)  # Normalize over time and channels
+    
+    # Spatial frequency axes
+    u = fftfreq(H) * H  # Frequency bins (normalized)
+    v = fftfreq(W) * W
+    U, V = np.meshgrid(u, v, indexing='ij')
+    spatial_freqs = np.sqrt(U**2 + V**2)  # Radial spatial frequency
+    
+    # --- Compute temporal Fourier transform (1D FFT along time axis per pixel) ---
+    temporal_bins = T // 2 + 1  # Correct number of frequency bins
+    temporal_spectrum = np.zeros(temporal_bins)  # Initialize correctly
+    
+    for c in range(C):
+        for i in range(H):
+            for j in range(W):
+                fft_time = np.abs(rfft(image_stack[i, j, :, c]))  # 1D FFT along time
+                if fft_time.shape[0] == temporal_bins:  # Ensure correct shape
+                    temporal_spectrum += fft_time
+    
+    temporal_spectrum /= (H * W * C)  # Normalize over space and channels
+    
+    # Temporal frequency axis
+    temporal_freqs = rfftfreq(T, d=1/fps)
+    
+    # --- Plot spatial frequency spectrum ---
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(np.log1p(spatial_spectrum), cmap='inferno', extent=[v.min(), v.max(), u.min(), u.max()])
+    plt.colorbar(label='Log Magnitude')
+    plt.xlabel('Spatial Frequency X')
+    plt.ylabel('Spatial Frequency Y')
+    plt.title('Spatial Frequency Spectrum')
+    
+    # --- Plot temporal frequency spectrum ---
+    plt.subplot(1, 2, 2)
+    plt.plot(temporal_freqs, np.log1p(temporal_spectrum), color='blue')
+    plt.xlabel('Temporal Frequency (Hz)')
+    plt.ylabel('Log Magnitude')
+    plt.title('Temporal Frequency Spectrum')
+    
+    plt.tight_layout()
+    plt.show()
 
     
 
@@ -273,11 +383,15 @@ def main():
         face_coords = get_face(coordinates)
         cropped_clip = crop_video(video_clip, face_coords)
         array = video_to_numpy_array(cropped_clip)
-        i = 0
-        for freq_filtered in temporal_filter(array):
-            temp_filt_vid = ImageSequenceClip(list(freq_filtered), fps=30)
-            save_video(args.output+string(i)+".mp4", cropped_clip)
-            i+=1
+        # filtered_dict = temporal_filter(array)
+        plot_fourier_distribution(array, fps=30)
+        
+        
+        # i = 0
+        # for freq_filtered in filtered_dict:
+            # temp_filt_vid = ImageSequenceClip(list(freq_filtered), fps=30)
+            # save_video(args.output+string(i)+".mp4", cropped_clip)
+            # i+=1
         
         
         # cropping out video of just the face
